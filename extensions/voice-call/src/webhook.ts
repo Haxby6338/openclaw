@@ -12,6 +12,7 @@ import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
 import type { VoiceCallProvider } from "./providers/base.js";
+import { OpenAIRealtimeConversationProvider } from "./providers/openai-realtime-conversation.js";
 import { OpenAIRealtimeSTTProvider } from "./providers/stt-openai-realtime.js";
 import type { TwilioProvider } from "./providers/twilio.js";
 import type { NormalizedEvent, WebhookContext } from "./types.js";
@@ -68,20 +69,23 @@ export class VoiceCallWebhookServer {
       return;
     }
 
-    const sttProvider = new OpenAIRealtimeSTTProvider({
-      apiKey,
-      model: this.config.streaming?.sttModel,
-      silenceDurationMs: this.config.streaming?.silenceDurationMs,
-      vadThreshold: this.config.streaming?.vadThreshold,
-    });
+    const isConversationMode =
+      this.config.streaming?.sttProvider === "openai-realtime-conversation";
 
-    const streamConfig: MediaStreamConfig = {
-      sttProvider,
+    // Shared callbacks used by both STT and conversation modes
+    const sharedCallbacks = {
       preStartTimeoutMs: this.config.streaming?.preStartTimeoutMs,
       maxPendingConnections: this.config.streaming?.maxPendingConnections,
       maxPendingConnectionsPerIp: this.config.streaming?.maxPendingConnectionsPerIp,
       maxConnections: this.config.streaming?.maxConnections,
-      shouldAcceptStream: ({ callId, token }) => {
+      shouldAcceptStream: ({
+        callId,
+        token,
+      }: {
+        callId: string;
+        streamSid: string;
+        token?: string;
+      }) => {
         const call = this.manager.getCallByProviderCallId(callId);
         if (!call) {
           return false;
@@ -95,11 +99,12 @@ export class VoiceCallWebhookServer {
         }
         return true;
       },
-      onTranscript: (providerCallId, transcript) => {
+      onTranscript: (providerCallId: string, transcript: string) => {
         console.log(`[voice-call] Transcript for ${providerCallId}: ${transcript}`);
 
-        // Clear TTS queue on barge-in (user started speaking, interrupt current playback)
-        if (this.provider.name === "twilio") {
+        // In STT mode, clear TTS queue on barge-in (user started speaking)
+        // Conversation mode handles barge-in via response.cancel + clearAudio directly
+        if (!isConversationMode && this.provider.name === "twilio") {
           (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
         }
 
@@ -122,42 +127,46 @@ export class VoiceCallWebhookServer {
         };
         this.manager.processEvent(event);
 
-        // Auto-respond in conversation mode (inbound always, outbound if mode is conversation)
-        const callMode = call.metadata?.mode as string | undefined;
-        const shouldRespond = call.direction === "inbound" || callMode === "conversation";
-        if (shouldRespond) {
-          this.handleInboundResponse(call.callId, transcript).catch((err) => {
-            console.warn(`[voice-call] Failed to auto-respond:`, err);
-          });
+        // STT mode: auto-respond via Pi agent (conversation mode bypasses agent entirely)
+        if (!isConversationMode) {
+          const callMode = call.metadata?.mode as string | undefined;
+          const shouldRespond = call.direction === "inbound" || callMode === "conversation";
+          if (shouldRespond) {
+            this.handleInboundResponse(call.callId, transcript).catch((err) => {
+              console.warn(`[voice-call] Failed to auto-respond:`, err);
+            });
+          }
         }
       },
-      onSpeechStart: (providerCallId) => {
-        if (this.provider.name === "twilio") {
+      onSpeechStart: (providerCallId: string) => {
+        // STT mode: clear TTS queue on barge-in
+        // Conversation mode: barge-in is handled inside the provider (response.cancel + clearAudio)
+        if (!isConversationMode && this.provider.name === "twilio") {
           (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
         }
       },
-      onPartialTranscript: (callId, partial) => {
+      onPartialTranscript: (callId: string, partial: string) => {
         console.log(`[voice-call] Partial for ${callId}: ${partial}`);
       },
-      onConnect: (callId, streamSid) => {
+      onConnect: (callId: string, streamSid: string) => {
         console.log(`[voice-call] Media stream connected: ${callId} -> ${streamSid}`);
-        // Register stream with provider for TTS routing
+        // Register stream with provider for TTS routing (needed in STT mode)
         if (this.provider.name === "twilio") {
           (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
         }
 
-        // Speak initial message if one was provided when call was initiated
-        // Use setTimeout to allow stream setup to complete
+        // Speak initial message if one was provided when call was initiated.
+        // In conversation mode this will use the Pi agent speak path (if configured);
+        // callers can skip this by not setting an initial message.
         setTimeout(() => {
           this.manager.speakInitialMessage(callId).catch((err) => {
             console.warn(`[voice-call] Failed to speak initial message:`, err);
           });
         }, 500);
       },
-      onDisconnect: (callId) => {
+      onDisconnect: (callId: string) => {
         console.log(`[voice-call] Media stream disconnected: ${callId}`);
-        // Auto-end call when media stream disconnects to prevent stuck calls.
-        // Without this, calls can remain active indefinitely after the stream closes.
+        // Auto-end call when media stream disconnects to prevent stuck calls
         const disconnectedCall = this.manager.getCallByProviderCallId(callId);
         if (disconnectedCall) {
           console.log(
@@ -172,6 +181,28 @@ export class VoiceCallWebhookServer {
         }
       },
     };
+
+    let streamConfig: MediaStreamConfig;
+
+    if (isConversationMode) {
+      const conversationProvider = new OpenAIRealtimeConversationProvider({
+        apiKey,
+        model: this.config.streaming?.realtimeModel,
+        voice: this.config.streaming?.realtimeVoice,
+        systemPrompt: this.config.streaming?.realtimeSystemPrompt,
+        silenceDurationMs: this.config.streaming?.silenceDurationMs,
+        vadThreshold: this.config.streaming?.vadThreshold,
+      });
+      streamConfig = { conversationProvider, ...sharedCallbacks };
+    } else {
+      const sttProvider = new OpenAIRealtimeSTTProvider({
+        apiKey,
+        model: this.config.streaming?.sttModel,
+        silenceDurationMs: this.config.streaming?.silenceDurationMs,
+        vadThreshold: this.config.streaming?.vadThreshold,
+      });
+      streamConfig = { sttProvider, ...sharedCallbacks };
+    }
 
     this.mediaStreamHandler = new MediaStreamHandler(streamConfig);
     console.log("[voice-call] Media streaming initialized");
